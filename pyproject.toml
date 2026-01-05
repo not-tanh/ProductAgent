@@ -1,0 +1,11 @@
+[project]
+name = "productagent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "kaggle>=1.8.3",
+    "kagglehub>=0.3.13",
+    "polars>=1.36.1",
+]

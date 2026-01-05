@@ -1,0 +1,1 @@
+kaggle datasets download -d asaniczka/amazon-canada-products-2023-2-1m-products -p data/raw --unzip
