@@ -1,16 +1,14 @@
-import sys
-import os
 import json
+import os
+import sys
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Header, Response, HTTPException
-from pydantic import BaseModel
-from dotenv import load_dotenv
 import redis.asyncio as redis
-
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
@@ -18,10 +16,13 @@ from langchain_core.messages import (
     messages_to_dict,
     messages_from_dict,
 )
+from langfuse import get_client, propagate_attributes
+from langfuse.langchain import CallbackHandler
+from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
-from agents import orchestrator_agent
+from agents import simple_agent
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
@@ -34,12 +35,14 @@ LOCK_KEY_PREFIX = os.getenv("LOCK_KEY_PREFIX", "chat:lock:")
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
+    app_.state.langfuse = get_client()
     app_.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
     try:
         await app_.state.redis.ping()
         yield
     finally:
         await app_.state.redis.close()
+        app_.state.langfuse.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -72,10 +75,6 @@ async def save_history(session_id: str, messages: list[BaseMessage]) -> None:
     redis_client = app.state.redis
 
     assert redis_client is not None
-
-    # Trim to last N messages to control context and cost
-    if len(messages) > MAX_HISTORY_MESSAGES:
-        messages = messages[-MAX_HISTORY_MESSAGES:]
 
     payload = json.dumps(messages_to_dict(messages), ensure_ascii=False)
     await redis_client.set(_session_key(session_id), payload, ex=SESSION_TTL_SECONDS)
@@ -118,12 +117,31 @@ async def chat(
     if not await lock.acquire():
         raise HTTPException(status_code=409, detail="Session is busy. Retry.")
 
+    langfuse = app.state.langfuse
+
     try:
         history = await load_history(session_id)
         history.append(HumanMessage(content=body.message))
 
-        # Invoke agent
-        result = await orchestrator_agent.ainvoke({"messages": history})
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="chat_request",
+            input={"message": body.message},
+        ) as root_span:
+            with propagate_attributes(
+                session_id=session_id,
+                user_id=session_id,
+                tags=["product-agent", "fastapi"],
+                metadata={"endpoint": "/chat"},
+            ):
+                handler = CallbackHandler()
+
+                # Trim to last N messages to control context and cost
+                result = await simple_agent.ainvoke(
+                    {"messages": history[-MAX_HISTORY_MESSAGES:]}, config={"callbacks": [handler]})
+
+                reply = result["messages"][-1].content
+                root_span.update(output={"reply": reply})
 
         new_history = result.get("messages")
 
