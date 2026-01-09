@@ -12,3 +12,4 @@ wheels/
 *.csv
 *.parquet
 .idea
+*.ipynb
