@@ -78,10 +78,6 @@ class HybridSearchEngine:
 
         filter_condition = models.Filter(must=must_filters)
 
-        print(f"\n"
-              f"[SEARCH] Query: '{query_text}' | Filter: Price {min_price}-{max_price} | "
-              f"Top-k : {top_k}")
-
         results = self.client.query_points(
             collection_name=COLLECTION_NAME,
             prefetch=models.Prefetch(

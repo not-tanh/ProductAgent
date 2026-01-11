@@ -145,12 +145,6 @@ async def chat(
 
         new_history = result.get("messages")
 
-        # print('Len:', len(new_history))
-        # for h in new_history:
-        #     print(json.dumps(h, indent=4))
-        #     print('=' * 50)
-        # chat_log_only = [m for m in new_history if isinstance(m, (HumanMessage, AIMessage))]
-
         # Persist full message trace (or filter to only Human/AI if preferred)
         await save_history(session_id, new_history)
 
