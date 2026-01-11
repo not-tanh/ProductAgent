@@ -10,11 +10,12 @@ load_dotenv()
 from agents.prompts import ORCHESTRATOR_AGENT_PROMPT, SIMPLE_AGENT_PROMPT
 from agents.product_search_agent import internal_search, search_products_tool
 from agents.web_analysis_agent import web_search, web_analysis_tool
-from agents.tools import product_analysis_tool, get_schema_duckdb
+from agents.product_analysis_agent import product_analysis, product_analysis_tool
+from agents.tools import get_schema_duckdb
 
 orchestrator_agent = create_agent(
     model=os.getenv('ORCHESTRATOR_MODEL'),
-    tools=[internal_search, web_search],
+    tools=[internal_search, web_search, product_analysis],
     system_prompt=ORCHESTRATOR_AGENT_PROMPT
 )
 

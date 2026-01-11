@@ -1,89 +1,111 @@
-import sys
-import os
-import argparse
+import os, sys, argparse
 import time
 
-from qdrant_client import QdrantClient, models
-from fastembed import TextEmbedding, SparseTextEmbedding
 import polars as pl
 from dotenv import load_dotenv
+from qdrant_client import QdrantClient, models
+from fastembed import TextEmbedding, SparseTextEmbedding
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
-COLLECTION_NAME = os.getenv('COLLECTION_NAME')
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', 8))
 
-# TODO: optimize HNSW, quantization, etc.
+COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+QDRANT_URL = os.getenv("QDRANT_URL")
+
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "8"))
+UPLOAD_BATCH = int(os.getenv("UPLOAD_BATCH", "1024"))
+
+SHARDS = int(os.getenv("SHARDS", "2"))
+
+TEXT_COL = "text_for_embedding"
+PAYLOAD_COLS = ["title", "price", "categoryName", "stars", "reviews", "productURL", "isBestSeller", "boughtInLastMonth"]
 
 
-def run_ingestion(parquet_path):
-    client = QdrantClient(url=os.getenv('QDRANT_URL'))
+def run_ingestion(parquet_path: str):
+    # gRPC is usually faster for large payloads
+    client = QdrantClient(url=QDRANT_URL, prefer_grpc=True)
 
-    dense_model = TextEmbedding(model_name=os.getenv('DENSE_MODEL'))
-    sparse_model = SparseTextEmbedding(model_name=os.getenv('SPARSE_MODEL'))
+    dense_model = TextEmbedding(model_name=os.getenv("DENSE_MODEL"))
+    sparse_model = SparseTextEmbedding(model_name=os.getenv("SPARSE_MODEL"))
 
     if not client.collection_exists(COLLECTION_NAME):
         client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config={"dense": models.VectorParams(size=384, distance=models.Distance.COSINE)},
-            sparse_vectors_config={"sparse": models.SparseVectorParams(index=models.SparseIndexParams(on_disk=True))}
+            shard_number=SHARDS,
+            vectors_config={
+                "dense": models.VectorParams(size=384, distance=models.Distance.COSINE),
+            },
+            sparse_vectors_config={
+                "sparse": models.SparseVectorParams(index=models.SparseIndexParams(on_disk=True))
+            },
+            # bulk ingestion mode: defer HNSW
+            hnsw_config=models.HnswConfigDiff(m=0),
+            optimizers_config=models.OptimizersConfigDiff(indexing_threshold=0),
         )
 
-    df = pl.read_parquet(parquet_path)
-    print(f"Ingesting {df.height} rows...")
+    # Read only required columns
+    df = pl.read_parquet(parquet_path, columns=[TEXT_COL] + PAYLOAD_COLS)
+    total = df.height
+    print(f"Ingesting {total} rows...")
     start_time = time.time()
+    next_id = 0
 
-    for i in range(0, df.height, BATCH_SIZE):
-        batch = df.slice(i, BATCH_SIZE)
-        documents = batch["text_for_embedding"].to_list()
+    for batch in df.iter_slices(n_rows=EMBED_BATCH):
+        docs = batch[TEXT_COL].to_list()
 
-        dense_vectors = list(dense_model.embed(documents))
-        sparse_vectors = list(sparse_model.embed(documents))
+        dense_vecs = list(dense_model.embed(docs, batch_size=EMBED_BATCH))
+        sparse_vecs = list(sparse_model.embed(docs, batch_size=EMBED_BATCH))
 
-        points = []
-        rows = batch.to_dicts()
+        payloads = batch.select(PAYLOAD_COLS).to_dicts()
 
-        for idx, row in enumerate(rows):
-            # Convert Sparse Vector from FastEmbed format to Qdrant format
-            qdrant_sparse = models.SparseVector(
-                indices=sparse_vectors[idx].indices.tolist(),
-                values=sparse_vectors[idx].values.tolist()
-            )
+        def gen_points():
+            nonlocal next_id
+            for j in range(len(docs)):
+                sv = models.SparseVector(
+                    indices=sparse_vecs[j].indices.tolist(),
+                    values=sparse_vecs[j].values.tolist(),
+                )
+                pid = next_id
+                next_id += 1
+                yield models.PointStruct(
+                    id=pid,
+                    vector={"dense": dense_vecs[j].tolist(), "sparse": sv},
+                    payload={
+                        "title": payloads[j]["title"],
+                        "price": payloads[j]["price"],
+                        "category": payloads[j]["categoryName"],
+                        "rating": payloads[j]["stars"],
+                        "reviews": payloads[j]["reviews"],
+                        "url": payloads[j]["productURL"],
+                        "isBestSeller": payloads[j]["isBestSeller"],
+                        "boughtInLastMonth": payloads[j]["boughtInLastMonth"],
+                    },
+                )
 
-            payload = {
-                "title": row["title"],
-                "price": row["price"],
-                "category": row["categoryName"],
-                "rating": row["stars"],
-                "reviews": row["reviews"],
-                "url": row["productURL"],
-                "isBestSeller": row["isBestSeller"],
-                "boughtInLastMonth": row["boughtInLastMonth"]
-            }
+        # automatic batching + multi-process upload; don’t block on each batch
+        client.upload_points(
+            collection_name=COLLECTION_NAME,
+            points=gen_points(),
+            batch_size=UPLOAD_BATCH,
+            wait=False,
+        )
 
-            points.append(models.PointStruct(
-                id=i + idx,
-                vector={
-                    "dense": dense_vectors[idx].tolist(),
-                    "sparse": qdrant_sparse
-                },
-                payload=payload
-            ))
-
-        client.upsert(COLLECTION_NAME, points)
-        sys.stdout.write(f"\r[Processing] Uploaded {i + BATCH_SIZE}/{df.height}"
-                         f" | Average time per record: {(time.time() - start_time) / (i + BATCH_SIZE)}")
+        sys.stdout.write(
+            f"\r[Processing] Uploaded {min(next_id, total)}/{total}"
+            f" | Average time per record: {(time.time() - start_time) / min(next_id, total)}")
         sys.stdout.flush()
 
     print("\n[SUCCESS] Ingestion Finished.")
 
-    print("Ingestion Done. Database is ready.")
-
+    # Re-enable indexing for production settings
+    client.update_collection(
+        collection_name=COLLECTION_NAME,
+        hnsw_config=models.HnswConfigDiff(m=16),
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=20000),
+    )
+    print("Collection switched to production indexing settings.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-i", "--input", type=str, help="Path to parquet file (for ingest)", required=True)
+    parser.add_argument("-i", "--input", type=str, required=True)
     args = parser.parse_args()
-
     run_ingestion(args.input)
