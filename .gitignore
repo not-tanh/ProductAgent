@@ -13,3 +13,4 @@ wheels/
 *.parquet
 .idea
 *.ipynb
+*.duckdb

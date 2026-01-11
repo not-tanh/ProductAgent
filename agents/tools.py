@@ -1,9 +1,16 @@
+import os
+import sys
 from typing import List, Optional, Dict, Any
+
 from langchain_core.tools import tool
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+import duckdb
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from search.engine import HybridSearchEngine
+load_dotenv()
 
 search_engine = HybridSearchEngine()
 
@@ -89,3 +96,65 @@ def web_analysis_tool(query: str) -> List[WebResult]:
         ))
 
     return structured_response
+
+
+@tool
+def product_analysis_tool(sql_query: str) -> str:
+    """
+    Executes a read-only SQL query and returns the results.
+    Includes safeguards to prevent context-window bloat.
+    """
+    conn = None
+    try:
+        conn = duckdb.connect(os.getenv('DUCKDB'), read_only=True)
+
+        forbidden_keywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER']
+        if any(keyword in sql_query.upper() for keyword in forbidden_keywords):
+            return "Error: Read-only access. Modification commands are not allowed."
+
+        cursor = conn.execute(sql_query)
+
+        # Limit the query to prevent crashing the agent
+        rows = cursor.fetchmany(10)
+        columns = [desc[0] for desc in cursor.description]
+
+        if not rows:
+            return "Query executed successfully but returned no results."
+
+        result_str = f"Columns: {', '.join(columns)}\n"
+        for row in rows:
+            result_str += str(row) + "\n"
+
+        return result_str
+
+    except Exception as e:
+        # Return the actual database error so the LLM can self-correct
+        return f"Database Error: {str(e)}"
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_schema_duckdb():
+        """
+        Returns the table schema so the LLM knows which columns to query.
+        """
+        conn = None
+        try:
+            conn = duckdb.connect(os.getenv('DUCKDB'), read_only=True)
+            schema_query = """
+                SELECT column_name, data_type 
+                FROM information_schema.columns 
+                WHERE table_name = 'products'
+            """
+            results = conn.execute(schema_query).fetchall()
+            # Format as a clean string for the LLM
+            schema_str = "Table 'products' columns:\n"
+            for col, dtype in results:
+                schema_str += f"- {col} ({dtype})\n"
+            return schema_str
+        except Exception as e:
+            return f"Error fetching schema: {str(e)}"
+        finally:
+            if conn:
+                conn.close()
