@@ -14,3 +14,6 @@ wheels/
 .idea
 *.ipynb
 *.duckdb
+data
+.DS_Store
+*.zip

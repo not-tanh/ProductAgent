@@ -41,7 +41,7 @@ def init_collection():
                 "dense": models.VectorParams(size=384, distance=models.Distance.COSINE),
             },
             sparse_vectors_config={
-                "sparse": models.SparseVectorParams(index=models.SparseIndexParams(on_disk=True))
+                "sparse": models.SparseVectorParams(index=models.SparseIndexParams(on_disk=False))
             },
             # Bulk ingestion optimization: Disable HNSW indexing during upload
             hnsw_config=models.HnswConfigDiff(m=0),
@@ -96,7 +96,6 @@ def worker_task(parquet_path: str, offset: int, length: int, worker_id: int):
     for batch in df.iter_slices(n_rows=EMBED_BATCH):
         docs = batch[TEXT_COL].to_list()
 
-        # Embed
         dense_vecs = list(dense_model.embed(docs, batch_size=EMBED_BATCH))
         sparse_vecs = list(sparse_model.embed(docs, batch_size=EMBED_BATCH))
 
@@ -111,7 +110,6 @@ def worker_task(parquet_path: str, offset: int, length: int, worker_id: int):
                     values=sparse_vecs[j].values.tolist(),
                 )
 
-                # Create point
                 pt = models.PointStruct(
                     id=current_global_id,
                     vector={"dense": dense_vecs[j].tolist(), "sparse": sv},
@@ -140,7 +138,6 @@ def worker_task(parquet_path: str, offset: int, length: int, worker_id: int):
 
         processed_count += len(docs)
 
-        # Simple logging per worker (every ~500 rows to avoid clutter)
         if processed_count % 512 == 0:
             elapsed = time.time() - local_start_time
             print(f"[Worker {worker_id}] Uploaded {processed_count}/{length} | {processed_count/elapsed:.1f} doc/s")
@@ -166,7 +163,7 @@ def run_parallel_ingestion(parquet_path: str, process_num: int):
 
     for i in range(process_num):
         offset = i * chunk_size
-        # Ensure the last chunk doesn't exceed total
+
         length = min(chunk_size, total_rows - offset)
 
         if length > 0:

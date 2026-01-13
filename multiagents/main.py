@@ -1,6 +1,6 @@
-import json
 import os
 import sys
+import json
 import traceback
 import uuid
 from contextlib import asynccontextmanager
@@ -9,26 +9,21 @@ from typing import Optional
 import redis.asyncio as redis
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
-from langchain_core.messages import (
-    BaseMessage,
-    HumanMessage,
-    AIMessage,
-    messages_to_dict,
-    messages_from_dict,
-)
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
 from langfuse import get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv()
-from agents import simple_agent
+
+from agents import planner_agent
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/")
-SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
-LOCK_TTL_SECONDS = int(os.getenv("SESSION_LOCK_TTL_SECONDS", "10"))
 
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
+LOCK_TTL_SECONDS = int(os.getenv("SESSION_LOCK_TTL_SECONDS", "10"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
 SESSION_KEY_PREFIX = os.getenv("SESSION_KEY_PREFIX", "chat:session:")
 LOCK_KEY_PREFIX = os.getenv("LOCK_KEY_PREFIX", "chat:lock:")
 
@@ -43,9 +38,6 @@ async def lifespan(app_: FastAPI):
     finally:
         await app_.state.redis.close()
         app_.state.langfuse.shutdown()
-
-
-app = FastAPI(lifespan=lifespan)
 
 
 def _session_key(session_id: str) -> str:
@@ -80,8 +72,14 @@ async def save_history(session_id: str, messages: list[BaseMessage]) -> None:
     await redis_client.set(_session_key(session_id), payload, ex=SESSION_TTL_SECONDS)
 
 
+app = FastAPI(lifespan=lifespan)
+
+
+def _lock_key(session_id: str) -> str:
+    return f"{LOCK_KEY_PREFIX}{session_id}"
+
+
 def extract_last_ai_text(messages: list[BaseMessage]) -> str:
-    # Find the last AI message (do not assume last element is AI)
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             return msg.content
@@ -107,7 +105,7 @@ async def chat(
 
     session_id = x_session_id or str(uuid.uuid4())
 
-    # Per-session lock to prevent concurrent requests overwriting history
+    # Per-session lock to prevent concurrent graph runs overwriting checkpoints.
     lock = redis_client.lock(
         _lock_key(session_id),
         timeout=LOCK_TTL_SECONDS,
@@ -131,22 +129,21 @@ async def chat(
             with propagate_attributes(
                 session_id=session_id,
                 user_id=session_id,
-                tags=["product-agent", "fastapi"],
                 metadata={"endpoint": "/chat"},
             ):
                 handler = CallbackHandler()
 
-                # Trim to last N messages to control context and cost
-                result = await simple_agent.ainvoke(
-                    {"messages": history[-MAX_HISTORY_MESSAGES:]}, config={"callbacks": [handler]})
+                result = await planner_agent.ainvoke(
+                    {"messages": history[-MAX_HISTORY_MESSAGES:]},
+                    config={"callbacks": [handler]}
+                )
 
-                reply = result["messages"][-1].content
+                reply = extract_last_ai_text(result.get("messages", []))
                 root_span.update(output={"reply": reply})
 
         new_history = result.get("messages")
         await save_history(session_id, new_history)
 
-        reply = extract_last_ai_text(new_history)
         return ChatResponse(session_id=session_id, reply=reply)
 
     finally:
@@ -154,4 +151,3 @@ async def chat(
             await lock.release()
         except Exception:
             traceback.print_exc()
-            pass

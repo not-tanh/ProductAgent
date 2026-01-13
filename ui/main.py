@@ -37,7 +37,7 @@ def call_chat_api(message: str, api_base: str, session_id: str | None, timeout: 
 with st.sidebar:
     st.header("Settings")
     st.session_state.api_base = st.text_input("CHAT_API_BASE_URL", value=st.session_state.api_base)
-    timeout_s = st.number_input("Timeout (seconds)", min_value=5, max_value=300, value=60, step=5)
+    timeout_s = st.number_input("Timeout (seconds)", min_value=5, max_value=300, value=120, step=5)
     show_debug = st.checkbox("Show debug response", value=False)
 
     st.divider()
