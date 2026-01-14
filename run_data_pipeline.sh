@@ -8,4 +8,4 @@ python data_pipeline/cleaning.py -i data/raw/amz_ca_total_products_data_processe
 python data_pipeline/create_duckdb.py -i products.parquet -o products.duckdb
 
 # Ingest into Qdrant
-python data_pipeline/ingest_job.py -i products.parquet
+python data_pipeline/ingest_job.py -i products.parquet -p 2
